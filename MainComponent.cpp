@@ -1,6 +1,13 @@
 #include "MainComponent.h"
 #include <iomanip>
 
+#ifdef _WIN32
+#include <Windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <iostream>
+#endif
+
 //==============================================================================
 MainComponent::MainComponent()
 {
@@ -15,26 +22,15 @@ MainComponent::MainComponent()
     setSize(500, 600);
 
     // Initialize the device manager and add this component as the audio callback.
-    // We request 2 input channels and 0 output channels.
     deviceManager.initialiseWithDefaultDevices(2, 0);
     deviceManager.addAudioCallback(this);
 
     // Create the audio device selector component.
     audioSetupComp = std::make_unique<juce::AudioDeviceSelectorComponent>(
         deviceManager,
-        0,     // min input channels
-        2,     // max input channels
-        0,     // min output channels
-        0,     // max output channels
-        false, // show midi inputs?
-        false, // show midi outputs?
-        true,  // show channels as stereo pairs?
-        false  // show logic for choosing audio device?
-    );
+        0, 2, 0, 0, false, false, true, false);
 
-    // Add the component to our main window and make it visible.
     addAndMakeVisible(*audioSetupComp);
-
     startTimer(50);
 }
 
@@ -45,11 +41,15 @@ MainComponent::~MainComponent()
 
 void MainComponent::resized()
 {
-    // Position the audio setup component at the top.
     auto bounds = getLocalBounds();
     audioSetupComp->setBounds(bounds.removeFromTop(400));
 }
 
+void MainComponent::timerCallback()
+{
+    // This timer callback simply triggers a repaint to update the UI.
+    repaint();
+}
 
 void MainComponent::audioDeviceAboutToStart(juce::AudioIODevice* device)
 {
@@ -71,19 +71,14 @@ void MainComponent::audioDeviceStopped()
 void MainComponent::audioDeviceIOCallback(const float** inputChannelData, int numInputChannels,
     float** outputChannelData, int numOutputChannels, int numSamples)
 {
-    // If we have input data...
     if (numInputChannels > 0 && inputChannelData[0] != nullptr)
     {
-        // Create a temporary buffer to calculate the RMS level.
         juce::AudioBuffer<float> tempBuffer((float**)inputChannelData, 1, numSamples);
         auto level = tempBuffer.getRMSLevel(0, 0, numSamples);
         inputLevel = (std::max)(level, inputLevel.load() * 0.95f);
-
-        // Process the block with our BPM detector.
         bpmDetector.processBlock(inputChannelData[0], numSamples);
     }
 
-    // We are not producing any output, so we must clear the output buffers.
     for (int i = 0; i < numOutputChannels; ++i)
         if (outputChannelData[i] != nullptr)
             juce::FloatVectorOperations::clear(outputChannelData[i], numSamples);
@@ -94,7 +89,6 @@ void MainComponent::paint(juce::Graphics& g)
 {
     g.fillAll(getLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId));
 
-    // Get a fresh copy of the local bounds and remove the area used by the setup component.
     auto area = getLocalBounds();
     area.removeFromTop(audioSetupComp->getBottom());
     area = area.reduced(20);
