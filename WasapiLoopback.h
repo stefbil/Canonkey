@@ -1,9 +1,9 @@
 #pragma once
-#include <JuceHeader.h>   // <-- define JUCE_WINDOWS first
+#include <JuceHeader.h>
 
 #if JUCE_WINDOWS
 
-// Keep Windows headers tidy and stop min/max macros
+// Windows headers and stop min/max macros
 #ifndef NOMINMAX
 #define NOMINMAX 1
 #endif
@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-// Very small WASAPI loopback capturer (default render "what‑you‑hear").
+// Very small WASAPI loopback capturer
 // Calls onBlock with planar float** buffers.
 class WasapiLoopback
 {

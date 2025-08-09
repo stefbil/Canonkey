@@ -1,4 +1,4 @@
-﻿#include "MainComponent.h"
+#include "MainComponent.h"
 #include <algorithm>
 #include <cmath>
 
@@ -12,11 +12,14 @@ MainComponent::MainComponent()
     // ----- Audio engine & meter feed -----
     audio = std::make_unique<AudioEngine>();
 
-    audio->onAudioBlock = [this](const float* const* input, int numCh, int numSamples, double)
+    audio->onAudioBlock = [this](const float* const* input, int numCh, int numSamples, double sr)
         {
+            // keep sample rate fresh for analyzer
+            currentSampleRate.store(sr, std::memory_order_relaxed);
+
             if (numCh <= 0 || numSamples <= 0 || input == nullptr) return;
 
-            // Feed analyzer FIFO (mono mix) — single line, lock-free
+            // Feed analyzer FIFO (mono mix) — lock-free
             monoFifo.pushPlanarToMono(input, numCh, numSamples);
 
             // Visual peak meter (fast + light)
@@ -55,6 +58,16 @@ MainComponent::MainComponent()
     // Small debug timer to "sip" the FIFO and log RMS (once/sec)
     startTimerHz(20);
 
+    // Analyzer (creates thread but starts when audio starts)
+    analyzer = std::make_unique<LiveAnalyzer>(monoFifo, currentSampleRate);
+    analyzer->setBpmCallback([this](double bpm, double /*conf*/)
+        {
+            juce::MessageManager::callAsync([this, bpm]
+                {
+                    liveResultBpm.setText(juce::String((int)std::round(bpm)) + " BPM", juce::dontSendNotification);
+                });
+        });
+
     // ----- Live card -----
     liveTitle.setText("Live Analysis", juce::dontSendNotification);
     liveTitle.setFont(juce::Font(20.0f, juce::Font::bold));
@@ -87,6 +100,9 @@ MainComponent::MainComponent()
                     liveBlockCounter.store(0);
                     liveFrames.setText("0 blocks", juce::dontSendNotification);
                     currentSource.setText(audio->getCurrentDeviceInfo().inputName, juce::dontSendNotification);
+
+                    if (analyzer && !analyzer->isRunning())
+                        analyzer->start();
                 }
                 else
                 {
@@ -102,11 +118,14 @@ MainComponent::MainComponent()
                 listening = false;
                 startListeningButton.setButtonText("Start Listening");
                 liveMeter.setLevels(0.0f, 0.0f); // ensure smooth decay to zero
+
+                // Optional: stop analyzer when stopping audio
+                // if (analyzer) analyzer->stop();
             }
         };
     addAndMakeVisible(startListeningButton);
 
-    // ---- Audio Source (popup menu) ----
+    // ---- Audio Source ----
     audioSourceButton.onClick = [this]
         {
             auto devices = audio->enumerateDevices();
@@ -155,6 +174,9 @@ MainComponent::MainComponent()
                                 currentSource.setText(it.entry.name, juce::dontSendNotification);
                                 liveBlockCounter.store(0);
                                 liveFrames.setText("0 blocks", juce::dontSendNotification);
+
+                                if (analyzer && !analyzer->isRunning())
+                                    analyzer->start();
                             }
                             else
                             {

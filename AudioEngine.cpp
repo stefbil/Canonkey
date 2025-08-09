@@ -236,7 +236,7 @@ AudioEngine::DeviceInfo AudioEngine::getCurrentDeviceInfo() const
 }
 
 //==============================================================================
-// JUCE 8 callback with context
+// callback with context
 void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* input, int numIn,
     float* const* output, int numOut,
     int numSamples,

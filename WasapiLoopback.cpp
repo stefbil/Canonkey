@@ -1,4 +1,4 @@
-#include <JuceHeader.h>   // <-- define JUCE_WINDOWS first
+#include <JuceHeader.h>
 
 #if JUCE_WINDOWS
 #include "WasapiLoopback.h"

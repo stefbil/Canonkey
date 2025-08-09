@@ -3,7 +3,8 @@
 #include <atomic>
 #include "AudioEngine.h"
 #include "PeakMeter.h"
-#include "RingBuffer.h"   // <-- add
+#include "RingBuffer.h"
+#include "LiveAnalyzer.h"
 
 namespace CanonkeyTheme
 {
@@ -57,8 +58,11 @@ private:
     juce::Label liveResultBpm{ {}, "BPM -" }, liveResultKey{ {}, "Key -" };
     juce::Label fileResultBpm{ {}, "BPM -" }, fileResultKey{ {}, "Key -" };
 
-    // ---- NEW: mono FIFO for analysis ----
+    // ---- mono FIFO for analysis ----
     RingBuffer monoFifo{ 1u << 16 };  // ~65k samples (~1.5 s at 44.1k)
+
+    std::atomic<double> currentSampleRate{ 0.0 };
+    std::unique_ptr<LiveAnalyzer> analyzer;
 
     // tiny debug tap to prove the FIFO has data (prints RMS occasionally)
     void timerCallback() override;

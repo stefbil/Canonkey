@@ -50,7 +50,7 @@ public:
     std::function<void(const float* const* input, int numCh, int numSamples, double sampleRate)>
         onAudioBlock;
 
-    // AudioIODeviceCallback (JUCE 8)
+    // AudioIODeviceCallback
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
     void audioDeviceStopped() override;
     void audioDeviceIOCallbackWithContext(const float* const* input, int numIn,
