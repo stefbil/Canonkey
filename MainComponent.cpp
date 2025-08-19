@@ -1,30 +1,167 @@
+#include <JuceHeader.h>
 #include "MainComponent.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint> // int64_t
 
-//==============================================================================
-// Constructor sets up the UI and audio plumbing.
+#include "BpmTracker.h"
+#include "KeyDetector.h"
+
+
+// Offline File Analyzer
+class MainComponent::FileAnalyzerThread : public juce::Thread
+{
+public:
+    FileAnalyzerThread(MainComponent& ownerRef, const juce::File& f)
+        : juce::Thread("FileAnalyzer"), owner(ownerRef), file(f) {}
+
+    void run() override
+    {
+        owner.fileAnalyzing.store(true);
+        owner.fileProgress.store(0.0f);
+
+        juce::AudioFormatManager fm; fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(file));
+        if (!reader)
+        {
+            postError("Unsupported or unreadable audio file.");
+            owner.fileAnalyzing.store(false);
+            return;
+        }
+
+        const double sr = reader->sampleRate > 8000.0 ? reader->sampleRate : 44100.0;
+        BpmTracker bpm((double)sr);
+        KeyDetector kd((double)sr);
+
+        const int64_t total = static_cast<int64_t>(reader->lengthInSamples);
+        const int     block = 32768; // ~0.74s @ 44.1k per read
+        juce::AudioBuffer<float> buf((int)std::min<int>(reader->numChannels, 2), block);
+        std::vector<float> mono((size_t)block, 0.0f);
+
+        int64_t pos = 0;
+        while (!threadShouldExit() && pos < total)
+        {
+            const int toRead = (int)std::min<int64_t>((int64_t)block, total - pos);
+            if (!reader->read(&buf, 0, toRead, pos, true, true))
+            {
+                postError("Read failed during decoding.");
+                owner.fileAnalyzing.store(false);
+                return;
+            }
+
+            const int numCh = buf.getNumChannels();
+            const float* L = buf.getReadPointer(0);
+            const float* R = (numCh > 1 ? buf.getReadPointer(1) : L);
+
+            for (int i = 0; i < toRead; ++i)
+                mono[(size_t)i] = 0.5f * (L[i] + R[i]);
+
+            bpm.processMono(mono.data(), toRead);
+            kd.processMono(mono.data(), toRead);
+
+            pos += toRead;
+            owner.fileProgress.store((float)((double)pos / (double)total));
+
+            juce::MessageManager::callAsync([this]
+                {
+                    owner.dropZone.setText("Analyzing: " + owner.currentFile.getFileName()
+                        + juce::String::formatted("  (%.0f%%)", owner.fileProgress.load() * 100.0f),
+                        juce::dontSendNotification);
+                    owner.fileResultBpm.setText("Analyzing…", juce::dontSendNotification);
+                    owner.fileResultKey.setText("-", juce::dontSendNotification);
+                });
+        }
+
+        if (threadShouldExit())
+        {
+            owner.fileAnalyzing.store(false);
+            return;
+        }
+
+        const float outBpm = bpm.getBpm();
+        const auto  keyRes = kd.getLast();
+
+        juce::MessageManager::callAsync([this, outBpm, keyRes]
+            {
+                if (threadShouldExit()) return;
+
+                if (outBpm > 0.0f)
+                    owner.fileResultBpm.setText(juce::String((int)std::round(outBpm)) + " BPM", juce::dontSendNotification);
+                else
+                    owner.fileResultBpm.setText("BPM -", juce::dontSendNotification);
+
+                if (keyRes.keyIndex >= 0)
+                    owner.fileResultKey.setText(owner.keyIndexToString(keyRes.keyIndex, keyRes.isMinor),
+                        juce::dontSendNotification);
+                else
+                    owner.fileResultKey.setText("Key -", juce::dontSendNotification);
+
+                owner.dropZone.setText("Drop audio file", juce::dontSendNotification);
+            });
+
+        owner.fileAnalyzing.store(false);
+    }
+
+    void postError(const juce::String& msg)
+    {
+        juce::MessageManager::callAsync([this, msg]
+            {
+                owner.dropZone.setText("Error: " + msg, juce::dontSendNotification);
+                owner.fileResultBpm.setText("BPM -", juce::dontSendNotification);
+                owner.fileResultKey.setText("Key -", juce::dontSendNotification);
+                juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon, "File Analysis", msg);
+            });
+    }
+
+private:
+    MainComponent& owner;
+    juce::File file;
+};
+
+//===================================BABABOOOOI=======================================
+// Constructor / Destructor
 MainComponent::MainComponent()
 {
     setOpaque(true);
+    setWantsKeyboardFocus(true);
     setSize(980, 600);
 
     // ----- Audio engine & meter feed -----
     audio = std::make_unique<AudioEngine>();
 
+    audio->onSampleRateChanged = [this](double sr)
+        {
+            currentSampleRate.store(sr, std::memory_order_relaxed);
+
+            if (analyzer) analyzer->requestReset();
+
+            juce::MessageManager::callAsync([this]
+                {
+                    if (listening)
+                    {
+                        liveResultBpm.setText("Listening...", juce::dontSendNotification);
+                        liveResultKey.setText("-", juce::dontSendNotification);
+                    }
+                    else
+                    {
+                        liveResultBpm.setText("-", juce::dontSendNotification);
+                        liveResultKey.setText("-", juce::dontSendNotification);
+                    }
+                });
+
+            bpm = std::make_unique<BpmTracker>(sr);
+            keydet = std::make_unique<KeyDetector>(sr);
+        };
+
     audio->onAudioBlock = [this](const float* const* input, int numCh, int numSamples, double sr)
         {
-            // keep sample rate fresh for analyzer
             currentSampleRate.store(sr, std::memory_order_relaxed);
 
             if (numCh <= 0 || numSamples <= 0 || input == nullptr) return;
 
-            // Feed analyzer FIFO (mono mix) — lock-free
             monoFifo.pushPlanarToMono(input, numCh, numSamples);
 
-            // Visual peak meter (fast + light)
             float l = 0.0f, r = 0.0f;
-
             if (numCh == 1)
             {
                 const float* ch = input[0];
@@ -47,6 +184,17 @@ MainComponent::MainComponent()
             r = juce::jmin(r, 1.0f);
             liveMeter.setLevels(l, r);
 
+            static std::vector<float> monoScratch;
+            monoScratch.resize((size_t)numSamples);
+
+            const float* L = input[0];
+            const float* R = (numCh > 1 ? input[1] : input[0]);
+            for (int i = 0; i < numSamples; ++i)
+                monoScratch[(size_t)i] = 0.5f * (L[i] + R[i]);
+
+            if (bpm)    bpm->processMono(monoScratch.data(), numSamples);
+            if (keydet) keydet->processMono(monoScratch.data(), numSamples);
+
             auto n = ++liveBlockCounter;
             if ((n % 30) == 0)
                 juce::MessageManager::callAsync([this, n]
@@ -55,16 +203,23 @@ MainComponent::MainComponent()
                     });
         };
 
-    // Small debug timer to "sip" the FIFO and log RMS (once/sec)
+    // UI update timer
     startTimerHz(20);
 
-    // Analyzer (creates thread but starts when audio starts)
+    // Analyzer thread for legacy live callbacks (optional)
     analyzer = std::make_unique<LiveAnalyzer>(monoFifo, currentSampleRate);
-    analyzer->setBpmCallback([this](double bpm, double /*conf*/)
+    analyzer->setBpmCallback([this](double bpmVal, double /*conf*/)
         {
-            juce::MessageManager::callAsync([this, bpm]
+            juce::MessageManager::callAsync([this, bpmVal]
                 {
-                    liveResultBpm.setText(juce::String((int)std::round(bpm)) + " BPM", juce::dontSendNotification);
+                    liveResultBpm.setText(juce::String((int)std::round(bpmVal)) + " BPM", juce::dontSendNotification);
+                });
+        });
+    analyzer->setKeyCallback([this](int keyIndex, bool isMinor, double /*conf*/)
+        {
+            juce::MessageManager::callAsync([this, keyIndex, isMinor]
+                {
+                    liveResultKey.setText(keyIndexToString(keyIndex, isMinor), juce::dontSendNotification);
                 });
         });
 
@@ -101,8 +256,18 @@ MainComponent::MainComponent()
                     liveFrames.setText("0 blocks", juce::dontSendNotification);
                     currentSource.setText(audio->getCurrentDeviceInfo().inputName, juce::dontSendNotification);
 
-                    if (analyzer && !analyzer->isRunning())
-                        analyzer->start();
+                    if (analyzer)
+                    {
+                        analyzer->requestReset();
+                        if (!analyzer->isRunning())
+                            analyzer->start();
+                    }
+
+                    if (bpm)    bpm->reset();
+                    if (keydet) keydet->reset();
+
+                    liveResultBpm.setText("Listening...", juce::dontSendNotification);
+                    liveResultKey.setText("-", juce::dontSendNotification);
                 }
                 else
                 {
@@ -117,10 +282,19 @@ MainComponent::MainComponent()
                 audio->stop();
                 listening = false;
                 startListeningButton.setButtonText("Start Listening");
-                liveMeter.setLevels(0.0f, 0.0f); // ensure smooth decay to zero
 
-                // Optional: stop analyzer when stopping audio
-                // if (analyzer) analyzer->stop();
+                if (analyzer)
+                {
+                    analyzer->requestReset();
+                    analyzer->stop();
+                }
+
+                if (bpm)    bpm->reset();
+                if (keydet) keydet->reset();
+
+                liveMeter.setLevels(0.0f, 0.0f);
+                liveResultBpm.setText("-", juce::dontSendNotification);
+                liveResultKey.setText("-", juce::dontSendNotification);
             }
         };
     addAndMakeVisible(startListeningButton);
@@ -175,8 +349,18 @@ MainComponent::MainComponent()
                                 liveBlockCounter.store(0);
                                 liveFrames.setText("0 blocks", juce::dontSendNotification);
 
-                                if (analyzer && !analyzer->isRunning())
-                                    analyzer->start();
+                                if (analyzer)
+                                {
+                                    analyzer->requestReset();
+                                    if (!analyzer->isRunning())
+                                        analyzer->start();
+                                }
+
+                                if (bpm)    bpm->reset();
+                                if (keydet) keydet->reset();
+
+                                liveResultBpm.setText("Listening...", juce::dontSendNotification);
+                                liveResultKey.setText("-", juce::dontSendNotification);
                             }
                             else
                             {
@@ -217,7 +401,7 @@ MainComponent::MainComponent()
     fileSubtitle.setColour(juce::Label::textColourId, CanonkeyTheme::subtitle());
     addAndMakeVisible(fileSubtitle);
 
-    dropZone.setInterceptsMouseClicks(false, false);
+    // Drop zone label (visual only; the whole MainComponent is a drop target)
     dropZone.setText("Drop audio file", juce::dontSendNotification);
     dropZone.setJustificationType(juce::Justification::centred);
     dropZone.setColour(juce::Label::backgroundColourId, CanonkeyTheme::dropZone().withAlpha(0.6f));
@@ -225,25 +409,36 @@ MainComponent::MainComponent()
     dropZone.setFont(juce::Font(14.0f));
     addAndMakeVisible(dropZone);
 
+    // --- Browse (keep chooser alive while dialog is open) ---
     browseButton.onClick = [this]
         {
-            juce::FileChooser chooser("Select an audio file",
+            if (fileAnalyzing.load())
+                cancelFileAnalysis();
+
+            fileChooser = std::make_unique<juce::FileChooser>(
+                "Select an audio file",
                 juce::File(),
                 "*.wav;*.mp3;*.aiff;*.aif;*.flac;*.ogg;*.m4a");
 
-            chooser.launchAsync(juce::FileBrowserComponent::openMode
-                | juce::FileBrowserComponent::canSelectFiles,
+            auto flags = juce::FileBrowserComponent::openMode
+                | juce::FileBrowserComponent::canSelectFiles;
+
+            fileChooser->launchAsync(flags,
                 [this](const juce::FileChooser& fc)
                 {
                     auto f = fc.getResult();
+                    fileChooser.reset(); // dialog is closed
+
                     if (f.existsAsFile())
-                        juce::AlertWindow::showMessageBoxAsync(
-                            juce::AlertWindow::InfoIcon,
-                            "Stub",
-                            "Selected file:\n" + f.getFullPathName());
+                        beginFileAnalysis(f);
                 });
         };
     addAndMakeVisible(browseButton);
+
+    // Cancel button
+    cancelButton.onClick = [this] { cancelFileAnalysis(); };
+    cancelButton.setEnabled(false);
+    addAndMakeVisible(cancelButton);
 
     for (auto* l : { &fileResultBpm, &fileResultKey })
     {
@@ -255,11 +450,24 @@ MainComponent::MainComponent()
     }
 }
 
+MainComponent::~MainComponent()
+{
+    cancelFileAnalysis(); // ensure any worker is stopped before destruction
+}
+
+// ============ Layout / Paint ============
 void MainComponent::paint(juce::Graphics& g)
 {
     g.fillAll(CanonkeyTheme::bg());
     drawCard(g, liveCardBounds);
     drawCard(g, fileCardBounds);
+
+    // Optional subtle outline when dragging over window
+    if (isDragOver)
+    {
+        g.setColour(CanonkeyTheme::accent().withAlpha(0.25f));
+        g.drawRoundedRectangle(fileCardBounds.reduced(6.0f), CanonkeyTheme::cardCornerRadius, 3.0f);
+    }
 }
 
 void MainComponent::resized()
@@ -277,11 +485,9 @@ void MainComponent::resized()
     liveTitle.setBounds(liveTop.removeFromLeft(220.0f).toNearestInt());
     liveSubtitle.setBounds(liveTop.toNearestInt());
 
-    // Big visible meter strip
     auto meterArea = live.removeFromTop(120.0f);
     liveMeter.setBounds(meterArea.toNearestInt().reduced(6));
 
-    // Counter at top-right of the meter
     auto framesBox = meterArea.removeFromTop(20.0f).removeFromRight(140.0f);
     liveFrames.setBounds(framesBox.toNearestInt());
 
@@ -301,7 +507,10 @@ void MainComponent::resized()
     fileSubtitle.setBounds(fileTop.toNearestInt());
 
     auto fileBottom = file.removeFromBottom(44.0f);
-    browseButton.setBounds(fileBottom.removeFromLeft(120.0f).toNearestInt().reduced(0, 4));
+    auto leftControls = fileBottom.removeFromLeft(260.0f);
+    browseButton.setBounds(leftControls.removeFromLeft(120.0f).toNearestInt().reduced(0, 4));
+    cancelButton.setBounds(leftControls.removeFromLeft(120.0f).toNearestInt().reduced(6, 4));
+
     auto fileBadges = fileBottom.removeFromRight(220.0f);
     fileResultBpm.setBounds(fileBadges.removeFromLeft(100.0f).toNearestInt().reduced(6));
     fileResultKey.setBounds(fileBadges.toNearestInt().reduced(6));
@@ -309,8 +518,12 @@ void MainComponent::resized()
     dropZone.setBounds(file.toNearestInt().reduced(4));
 }
 
+// ============ OS File Drag & Drop ============
 bool MainComponent::isInterestedInFileDrag(const juce::StringArray& files)
 {
+    if (files.isEmpty())
+        return true;
+
     for (auto& f : files)
         if (f.endsWithIgnoreCase(".wav") || f.endsWithIgnoreCase(".mp3") ||
             f.endsWithIgnoreCase(".aiff") || f.endsWithIgnoreCase(".aif") ||
@@ -321,14 +534,83 @@ bool MainComponent::isInterestedInFileDrag(const juce::StringArray& files)
     return false;
 }
 
+void MainComponent::fileDragEnter(const juce::StringArray& files, int, int)
+{
+    if (isInterestedInFileDrag(files))
+    {
+        isDragOver = true;
+        dropZone.setColour(juce::Label::backgroundColourId, CanonkeyTheme::dropZoneActive());
+        dropZone.setText("Release to analyze…", juce::dontSendNotification);
+        repaint();
+    }
+}
+
+void MainComponent::fileDragMove(const juce::StringArray& files, int, int)
+{
+    if (!isInterestedInFileDrag(files))
+        fileDragExit(files);
+}
+
+void MainComponent::fileDragExit(const juce::StringArray&)
+{
+    isDragOver = false;
+    dropZone.setColour(juce::Label::backgroundColourId, CanonkeyTheme::dropZone().withAlpha(0.6f));
+    dropZone.setText("Drop audio file", juce::dontSendNotification);
+    repaint();
+}
+
 void MainComponent::filesDropped(const juce::StringArray& files, int, int)
 {
-    if (files.isEmpty()) return;
+    isDragOver = false;
+    dropZone.setColour(juce::Label::backgroundColourId, CanonkeyTheme::dropZone().withAlpha(0.6f));
+    repaint();
 
-    juce::AlertWindow::showMessageBoxAsync(
-        juce::AlertWindow::InfoIcon,
-        "Stub",
-        "Dropped file:\n" + files[0]);
+    if (files.isEmpty()) return;
+    juce::File f(files[0]);
+    if (f.existsAsFile())
+        beginFileAnalysis(f);
+}
+
+// ============ Analysis Control ============
+void MainComponent::beginFileAnalysis(const juce::File& f)
+{
+    cancelFileAnalysis();
+
+    fileAnalyzing.store(false);
+    fileProgress.store(0.0f);
+    currentFile = f;
+
+    fileResultBpm.setText("Analyzing…", juce::dontSendNotification);
+    fileResultKey.setText("-", juce::dontSendNotification);
+    dropZone.setText("Analyzing: " + f.getFileName(), juce::dontSendNotification);
+
+    fileWorker = std::make_unique<FileAnalyzerThread>(*this, f);
+    fileWorker->startThread();
+    cancelButton.setEnabled(true);
+}
+
+void MainComponent::cancelFileAnalysis()
+{
+    if (fileWorker)
+    {
+        fileWorker->signalThreadShouldExit();
+        fileWorker->stopThread(2000);
+        fileWorker.reset();
+    }
+    fileAnalyzing.store(false);
+    fileProgress.store(0.0f);
+
+    dropZone.setText("Drop audio file", juce::dontSendNotification);
+    fileResultBpm.setText("BPM -", juce::dontSendNotification);
+    fileResultKey.setText("Key -", juce::dontSendNotification);
+    cancelButton.setEnabled(false);
+}
+
+juce::String MainComponent::keyIndexToString(int idx, bool isMinor)
+{
+    static const char* names[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+    if (idx < 0 || idx >= 12) return "Key -";
+    return juce::String(names[idx]) + (isMinor ? "m" : " maj");
 }
 
 void MainComponent::drawCard(juce::Graphics& g, const juce::Rectangle<float>& bounds)
@@ -344,18 +626,32 @@ void MainComponent::drawCard(juce::Graphics& g, const juce::Rectangle<float>& bo
 }
 
 //------------------------------------------------------------------------------
-// Debug sip from the FIFO: prints ~once/sec so you can verify buffered audio.
+// Debug + UI updater: also refreshes BPM/Key labels
 void MainComponent::timerCallback()
 {
-    static int tick = 0;
-    float scratch[1024];
-    const size_t got = monoFifo.pop(scratch, (size_t)std::size(scratch));
-    if (got > 0 && (++tick % 20) == 0) // 20 Hz timer → ~1 s
+    if (bpm)
     {
-        double acc = 0.0;
-        for (size_t i = 0; i < got; ++i) acc += (double)scratch[i] * (double)scratch[i];
-        const double rms = std::sqrt(acc / (double)got);
-        const double db = (rms > 0.0) ? 20.0 * std::log10(rms + 1e-12) : -120.0;
-        DBG("FIFO pop: " << (int)got << " samples, RMS ~ " << juce::String(db, 1) << " dB");
+        const float b = bpm->getBpm();
+        if (b > 0.0f)
+            liveResultBpm.setText(juce::String((int)std::round(b)) + " BPM", juce::dontSendNotification);
+        else if (listening)
+            liveResultBpm.setText("Listening...", juce::dontSendNotification);
     }
+
+    if (keydet)
+    {
+        auto r = keydet->getLast();
+        if (r.keyIndex >= 0)
+            liveResultKey.setText(keyIndexToString(r.keyIndex, r.isMinor), juce::dontSendNotification);
+    }
+
+    const bool analyzing = fileAnalyzing.load();
+    if (analyzing)
+    {
+        const float p = fileProgress.load();
+        dropZone.setText("Analyzing: " + currentFile.getFileName()
+            + juce::String::formatted("  (%.0f%%)", p * 100.0f),
+            juce::dontSendNotification);
+    }
+    cancelButton.setEnabled(analyzing);
 }

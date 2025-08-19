@@ -94,8 +94,11 @@ bool AudioEngine::startWASAPILoopback(juce::String& error)
         setup.outputDeviceName.clear();
         setup.useDefaultInputChannels = true;
         setup.useDefaultOutputChannels = false;
-        setup.sampleRate = 44100.0;
-        setup.bufferSize = 512;
+        
+        // let JUCE open the loopback at the device's current/native SR and buffer
+        // (no explicit sampleRate / bufferSize)
+        //setup.sampleRate = 44100.0;
+        //setup.bufferSize = 512;
 
         auto err = deviceManager.setAudioDeviceSetup(setup, true);
         if (err.isNotEmpty()) { error = err; return false; }
@@ -193,8 +196,8 @@ bool AudioEngine::startWASAPIInputDefault(juce::String& error)
 
 bool AudioEngine::startBestInputForLive(juce::String& error)
 {
-    // 1) Try JUCE WASAPI loopback (if Windows exposes it)
-    if (startWASAPILoopback(error))  return true;
+    // 1) Try JUCE WASAPI loopback
+    if (startWASAPILoopback(error))  return true;  // JUCE will call audioDeviceAboutToStart afterwards:contentReference[oaicite:0]{index=0}
 
 #if JUCE_WINDOWS
     // 2) Fallback: native WASAPI loopback of default render endpoint
@@ -202,6 +205,14 @@ bool AudioEngine::startBestInputForLive(juce::String& error)
     bool ok = wasapiLoopback->start(
         [this](const float* const* input, int numCh, int numSamples, double sr)
         {
+            // Publish SR changes for native loopback path as well
+            static double lastSr = 0.0;
+            if (onSampleRateChanged && sr > 0.0 && std::abs(sr - lastSr) > 1.0)
+            {
+                lastSr = sr;
+                onSampleRateChanged(sr);
+            }
+
             if (onAudioBlock) onAudioBlock(input, numCh, numSamples, sr);
         }, error);
     if (ok) { running.store(true); return true; }
@@ -220,13 +231,15 @@ void AudioEngine::stop()
     if (wasapiLoopback) { wasapiLoopback->stop(); wasapiLoopback.reset(); }
 #endif
 
-    // If we were using JUCE device I/O, tear it down.
     deviceManager.removeAudioCallback(this);
     if (auto* d = deviceManager.getCurrentAudioDevice())
         d->stop();
     deviceManager.closeAudioDevice();
 
     running.store(false);
+
+    // Notify listeners we've stopped (SR unknown)
+    if (onSampleRateChanged) onSampleRateChanged(0.0);
 }
 
 AudioEngine::DeviceInfo AudioEngine::getCurrentDeviceInfo() const
@@ -262,13 +275,20 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     info.sampleRate = device ? device->getCurrentSampleRate() : 0.0;
     info.blockSize = device ? device->getCurrentBufferSizeSamples() : 0;
     info.numIn = device ? device->getActiveInputChannels().countNumberOfSetBits() : 0;
-}
+
+    // NEW: tell listeners immediately about current SR (JUCE device path)
+    if (onSampleRateChanged) onSampleRateChanged(info.sampleRate);
+} // was present in your file; we just added the callback line:contentReference[oaicite:1]{index=1}
 
 void AudioEngine::audioDeviceStopped()
 {
     std::scoped_lock lk(infoMutex);
     info = {};
-}
+
+    // SR now unknown
+    if (onSampleRateChanged) onSampleRateChanged(0.0);
+} // was present in your file; we just added the callback line:contentReference[oaicite:2]{index=2}
+
 
 // --------- enumeration + validated startWithDevice ---------
 

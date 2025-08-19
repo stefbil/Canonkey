@@ -46,9 +46,12 @@ public:
 
     juce::AudioDeviceManager& getDeviceManager() noexcept { return deviceManager; }
 
-    // Audio callback: delivered on realtime thread
+    // Realtime audio block tap
     std::function<void(const float* const* input, int numCh, int numSamples, double sampleRate)>
         onAudioBlock;
+
+    // NEW: notify listeners when the device sample-rate changes (or starts/stops)
+    std::function<void(double newSampleRate)> onSampleRateChanged;
 
     // AudioIODeviceCallback
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
